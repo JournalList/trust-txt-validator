@@ -54,23 +54,28 @@ function validate_trust_txt($data) {
 
     // Fetch trust.txt file for the specified domain
     $response = fetch_trust_txt_url($domain);
-
+    $status_code = wp_remote_retrieve_response_code($response);
+    $status_message = wp_remote_retrieve_response_message($response);
     $wp_error = is_wp_error($response);
+    $status_code = wp_remote_retrieve_response_code($response);
+    $status_message = wp_remote_retrieve_response_message($response);
     if ($wp_error == true) {
         $wp_error_message = $response->get_error_message();
+        $error_message = " (" . $status_message . ", " . $wp_error_message . ")";
     } else {
         $wp_error_message = '';
+        $error_message = " (" . $status_message . ")";
     }
-    $status_code = wp_remote_retrieve_response_code($response);
-
     if ($wp_error || $status_code != 200) {
         return new WP_REST_Response(array(
             'is_wp_error' => $wp_error,
             'wp_error_message' => $wp_error_message,
             'status_code' => $status_code,
+            'status_message' => $status_message,
+            'flag' => 'invalid',
             'url' => $url,
             'domain' => $domain,
-            'message' => 'A trust.txt file was not found at ' . $url
+            'message' => 'A trust.txt file was not found at ' . $domain
         ), $status_code);
     } else {
         // Retrieve trust.txt content
@@ -85,10 +90,14 @@ function validate_trust_txt($data) {
         $member = [];
         $vendor = [];
         $social = [];
+        $contact = [];
+        $disclosure = [];
+        $datatrainingallowed = [];
         $self_reference = [];
 
         // Loop through each line and check for the keywords
         foreach ($lines as $line) {
+            $message = '';
             if (strpos($line, 'belongto=') === 0) {
                 $belongto_ref = trim(str_replace('belongto=', '', $line));
                 if ($domain == str_ireplace('www.', '', parse_url($belongto_ref, PHP_URL_HOST))) {
@@ -134,6 +143,15 @@ function validate_trust_txt($data) {
             if (strpos($line, 'social=') === 0) {
                 $social[] = trim(str_replace('social=', '', $line));
             }
+            if (strpos($line, 'contact=') === 0) {
+                $contact[] = trim(str_replace('contact=', '', $line));
+            }
+            if (strpos($line, 'disclosure=') === 0) {
+                $disclosure[] = trim(str_replace('disclosure=', '', $line));
+            }
+            if (strpos($line, 'datatrainingallowed=') === 0) {
+                $datatrainingallowed[] = trim(str_replace('datatrainingallowed=', '', $line));
+            }
         }
 
         // Validate referenced trust.txt files
@@ -142,13 +160,45 @@ function validate_trust_txt($data) {
         // Validate social entries for the Trust URI
         $social_validations = validate_social_trust_uri($social, $domain);
 
+        // Validate contact entries
+        $contact_validations = validate_contacts($contact);
+
+        // Validate disclosure entries
+        $disclosure_validations = validate_disclosures($disclosure);
+
+        // Validate datatrainingallowed entries
+        $datatrainingallowed_validations = validate_datatrainingallowed($datatrainingallowed);
+
+        // Check for self referential entries
+        if (count($self_reference) == 0) {
+            $flag = 'checkmark';
+            $message = 'A trust.txt file was found at ' . $domain;
+        } else {
+            $flag = 'warning';
+            $message = 'Self referential entries found in trust.txt file at ' . $domain;
+        }
+
+        // Check for multiple controlledby entries
+        if (count($controlledby) > 1) {
+            $flag = 'invalid';
+            if ($message != '') {
+                $message = 'Multiple "controlledby=" entries found in trust.txt file at ' . $domain;
+            } else {
+                $message = $message . '\nMultiple "controlledby=" entries found in trust.txt file at ' . $domain;
+            }
+        }
+
         // Prepare the result array
         $result = array(
             'is_wp_error' => $wp_error,
             'wp_error_message' => $wp_error_message,
             'status_code' => $status_code,
+            'status_message' => $status_message,
+            'error_message' => $error_message,
+            'flag' => $flag,
             'url' => $url,
             'domain' => $domain,
+            'message' => $message,
             'belongto' => $belongto,
             'control' => $control,
             'controlledby' => $controlledby,
@@ -156,9 +206,15 @@ function validate_trust_txt($data) {
             'member' => $member,
             'vendor' => $vendor,
             'social' => $social,
+            'contact' => $contact,
+            'disclosure' => $disclosure,
+            'datatrainingallowed' => $datatrainingallowed,
             'self_reference' => $self_reference,
             'referenced_validations' => $referenced_validations,
-            'social_validations' => $social_validations
+            'social_validations' => $social_validations,
+            'contact_validations' => $contact_validations,
+            'disclosure_validations' => $disclosure_validations,
+            'datatrainingallowed_validations' => $datatrainingallowed_validations
         );
         // Remove empty entries
         if (count($belongto) == 0) {
@@ -179,20 +235,22 @@ function validate_trust_txt($data) {
         if (count($vendor) == 0) {
             unset($result["vendor"]);
         }
+        if (count($contact) == 0) {
+            unset($result["contact"]);
+            unset($result["contact_validations"]);
+        }
+        if (count($disclosure) == 0) {
+            unset($result["disclosure"]);
+            unset($result["disclosure_validations"]);
+        }
+        if (count($datatrainingallowed) == 0) {
+            unset($result["datatrainingallowed"]);
+            unset($result["datatrainingallowed_validations"]);
+        }
         if (count($self_reference) == 0) {
             unset($result["self_reference"]);
         }
         return new WP_REST_Response($result, 200);
-    }
-}
-// Helper function to check self referential entries
-function check_self_ref($domain, $refernce_url) {
-    $url = str_ireplace('http:', 'https:', sanitize_text_field($reference_url));
-    $reference_domain = str_ireplace('www.', '', parse_url($url, PHP_URL_HOST));
-    if ($domain == $reference_domain) {
-        return true;
-    } else {
-        return false;
     }
 }
 // Helper function to fetch the trust.txt file from .well-known or root directory
@@ -206,11 +264,9 @@ function fetch_trust_txt_url($domain) {
         $trust_txt_url = 'https://www.' . rtrim($domain, '/') . '/.well-known/trust.txt';
         $response = wp_remote_get($trust_txt_url);
     }
-
     // Return response
     return $response;
 }
-
 // Helper function to validate referenced trust.txt files
 function validate_referenced_trust_txts($belongto, $controlledby, $vendor, $member, $control, $customer, $original_domain) {
     $all_references = array_merge($belongto, $controlledby, $vendor, $member, $control, $customer);
@@ -247,26 +303,25 @@ function validate_referenced_trust_txts($belongto, $controlledby, $vendor, $memb
             $fwd_attr = "customer";
             $rev_attr = "vendor";
         }
-
         // Make sure to use HTTPS and extract the domain from the URL
         $url = str_ireplace('http:', 'https:', sanitize_text_field($reference_url));
         $reference_domain = str_ireplace('www.', '', parse_url($url, PHP_URL_HOST));
-
         // Fetch referenced trust.txt file
         $response = fetch_trust_txt_url($reference_domain);
         $wp_error = is_wp_error($response);
+        $status_code = wp_remote_retrieve_response_code($response);
+        $status_message = wp_remote_retrieve_response_message($response);
         if ($wp_error == true) {
             $wp_error_message = $response->get_error_message();
+            $error_message = " (" . $status_message . ", " . $wp_error_message . ")";
         } else {
             $wp_error_message = '';
+            $error_message = " (" . $status_message . ")";
         }
-        $status_code = wp_remote_retrieve_response_code($response);
-
         // If fetch successful check the referenced trust.txt file for a reverse reference with the appropriate reverse attribute
         if (!$wp_error && $status_code == 200) {
             $trust_txt_content = wp_remote_retrieve_body($response);
             $lines = explode("\n", $trust_txt_content);
-
             // Check each line for a reverse attribute match containing the original domain of the referencing site
             foreach ($lines as $line) {
                 if (strpos($line, $rev_attr . '=') === 0 && strpos($line, $original_domain) !== false) {
@@ -275,14 +330,19 @@ function validate_referenced_trust_txts($belongto, $controlledby, $vendor, $memb
             }
             if ($rev_attr_found) {
                 $message = 'Corresponding "' . $rev_attr . '=https://www.' . $original_domain . '/" found at ' . $reference_url;
+                $flag = 'checkmark';
             } else {
                 $message = 'Corresponding "' . $rev_attr . '=https://www.' . $original_domain . '/" not found at ' . $reference_url;
+                $flag = 'invalid';
             }
             // Add the results for this referenced trust.txt to the restults array
             $results[] = array(
                 'is_wp_error' => $wp_error,
                 'wp_error_message' => $wp_error_message,
                 'status_code' => $status_code,
+                'status_message' => $status_message,
+                'error_message' => $error_message,
+                'flag' => $flag,
                 'reference_url' => $url,
                 'reference_domain' => $reference_domain,
                 'fwd_attr' => $fwd_attr,
@@ -296,6 +356,9 @@ function validate_referenced_trust_txts($belongto, $controlledby, $vendor, $memb
                 'is_wp_error' => $wp_error,
                 'wp_error_message' => $wp_error_message,
                 'status_code' => $status_code,
+                'status_message' => $status_message,
+                'error_message' => $error_message,
+                'flag' => 'unknown',
                 'reference_url' => $url,
                 'fwd_attr' => $fwd_attr,
                 'rev_attr' => $rev_attr,
@@ -307,7 +370,6 @@ function validate_referenced_trust_txts($belongto, $controlledby, $vendor, $memb
     }
     return $results;
 }
-
 // Helper function to validate social entries for the Trust URI
 function validate_social_trust_uri($social_urls, $original_domain) {
     $results = [];
@@ -316,22 +378,26 @@ function validate_social_trust_uri($social_urls, $original_domain) {
     foreach ($social_urls as $social_url) {
         $response = wp_remote_get($social_url);
         $wp_error = is_wp_error($response);
+        $status_code = wp_remote_retrieve_response_code($response);
+        $status_message = wp_remote_retrieve_response_message($response);
         if ($wp_error == true) {
             $wp_error_message = $response->get_error_message();
+            $error_message = " (" . $status_message . ", " . $wp_error_message . ")";
         } else {
             $wp_error_message = '';
+            $error_message = " (" . $status_message . ")";
         }
-        $status_code = wp_remote_retrieve_response_code($response);
-
         if (!$wp_error && $status_code == 200) {
             $page_content = wp_remote_retrieve_body($response);
-
             // Check if the Trust URI is present in the page content
             if (strpos($page_content, $trust_uri) !== false) {
                 $results[] = array(
                     'is_wp_error' => $wp_error,
                     'wp_error_message' => $wp_error_message,
                     'status_code' => $status_code,
+                    'status_message' => $status_message,
+                    'error_message' => $error_message,
+                    'flag' => 'checkmark',
                     'trust_uri_found' => true,
                     'trust_uri' => $trust_uri,
                     'social_url' => $social_url,
@@ -339,16 +405,26 @@ function validate_social_trust_uri($social_urls, $original_domain) {
                 );
             // Check if login is required
             } else {
-                if ((strpos($page_content, 'Sign ') !== false)) {
+                $pattern = array(
+                    "/sign[u|i| ]/mi",
+                    "/log[u|i| ]/mi",
+                    "/x\.com/",
+                    "/bsky\.social/"
+                );
+                if ((preg_match($pattern[0],$page_content) == 1) || (preg_match($pattern[1],$page_content) == 1) || 
+                    (preg_match($pattern[2],$page_content) == 1) || (preg_match($pattern[3],$page_content) == 1)) {
                     $results[] = array(
                         'status' => 'not found',
                         'is_wp_error' => $wp_error,
                         'wp_error_message' => $wp_error_message,
                         'status_code' => $status_code,
+                        'status_message' => $status_message,
+                        'error_message' => $error_message,
+                        'flag' => 'unknown',
                         'trust_uri_found' => false,
                         'trust_uri' => $trust_uri,
                         'social_url' => $social_url,
-                        'message' => 'Sign in required for social network account page ' . $social_url
+                        'message' => 'Login required for social network account page ' . $social_url
                     );
                 } else {
                     $results[] = array(
@@ -356,9 +432,13 @@ function validate_social_trust_uri($social_urls, $original_domain) {
                         'is_wp_error' => $wp_error,
                         'wp_error_message' => $wp_error_message,
                         'status_code' => $status_code,
+                        'status_message' => $status_message,
+                        'error_message' => $error_message,
+                        'flag' => 'invalid',
                         'trust_uri_found' => false,
                         'trust_uri' => $trust_uri,
                         'social_url' => $social_url,
+                        'page_content' => $page_content,
                         'message' => 'Trust URI ' . $trust_uri . ' not found on social network account page ' . $social_url
                     );
                 }
@@ -371,9 +451,174 @@ function validate_social_trust_uri($social_urls, $original_domain) {
                 'wp_error_message' => $wp_error_message,
                 'trust_uri_found' => false,
                 'status_code' => $status_code,
+                'status_message' => $status_message,
+                'error_message' => $error_message,
+                'flag' => 'unknown',
                 'social_url' => $social_url,
                 'message' => 'Could not retrieve the social network account page ' . $social_url
             );
+        }
+    }
+    return $results;
+}
+// Helper function to validate contact entries
+function validate_contacts($contacts) {
+    $results = [];
+    // For each contact entry
+    foreach ($contacts as $contact) {
+        // Verify contact scheme is valid
+        $scheme = parse_url($contact, PHP_URL_SCHEME);
+        if ($scheme == 'mailto')
+        {
+            $email = str_ireplace('mailto:','',$contact);
+            if (is_email($email)) {
+                $results[] = array(
+                    'valid_contact' => true,
+                    'scheme' => $scheme,
+                    'contact' => $contact
+                );
+            } else {
+                $results[] = array(
+                    'valid_contact' => false,
+                    'scheme' => $scheme,
+                    'contact' => $contact
+                );
+            }
+        } elseif ($scheme == 'tel') {
+            $phone = str_ireplace('tel:','',$contact);
+            if (strlen(filter_var($contact, FILTER_SANITIZE_NUMBER_INT)) >= 10) {
+                $results[] = array(
+                    'valid_contact' => true,
+                    'scheme' => $scheme,
+                    'contact' => $contact
+                );
+            } else {
+                $results[] = array(
+                    'valid_contact' => false,
+                    'scheme' => $scheme,
+                    'contact' => $contact
+                );
+            }
+        } elseif ($scheme == 'http' || $scheme == 'https') {
+            // Fetch contact URL
+            $response = wp_remote_get($contact);
+            $wp_error = is_wp_error($response);
+            $status_code = wp_remote_retrieve_response_code($response);
+            $status_message = wp_remote_retrieve_response_message($response);
+            if ($wp_error == true) {
+                $wp_error_message = $response->get_error_message();
+                $error_message = " (" . $status_message . ", " . $wp_error_message . ")";
+            } else {
+                $wp_error_message = '';
+                $error_message = " (" . $status_message . ")";
+            }
+            if (!$wp_error && $status_code == 200) {
+                $results[] = array(
+                    'valid_contact' => true,
+                    'scheme' => $scheme,
+                    'contact' => $contact
+                );
+            } else {
+                $results[] = array(
+                    'valid_contact' => false,
+                    'scheme' => $scheme,
+                    'contact' => $contact,
+                    'is_wp_error' => $wp_error,
+                    'wp_error_message' => $wp_error_message,
+                    'status_code' => $status_code,
+                    'status_message' => $status_message,
+                    'message' => $error_message
+                );
+            }
+        } else {
+            // Check if missing "mailto:" or "tel" in contact
+            if (is_email($contact)) {
+                $results[] = array(
+                    'valid_contact' => true,
+                    'scheme' => 'mailto',
+                    'contact' => $contact
+                );
+            } elseif (strlen(filter_var($contact, FILTER_SANITIZE_NUMBER_INT)) >= 10) {
+                $results[] = array(
+                    'valid_contact' => true,
+                    'scheme' => 'tel',
+                    'contact' => $contact
+                );
+            } else {
+                $results[] = array(
+                    'valid_contact' => false,
+                    'scheme' => $scheme,
+                    'contact' => $contact
+                );
+            }
+        }
+    }
+    return $results;
+}
+// Helper function for disclosures
+function validate_disclosures($disclosures) {
+    $results = [];
+    // For each disclosure entry
+    foreach ($disclosures as $disclosure) {
+        // Fetch contact URL
+        $response = wp_remote_get($disclosure);
+        $wp_error = is_wp_error($response);
+        $status_code = wp_remote_retrieve_response_code($response);
+        $status_message = wp_remote_retrieve_response_message($response);
+        if ($wp_error == true) {
+            $wp_error_message = $response->get_error_message();
+            $error_message = " (" . $status_message . ", " . $wp_error_message . ")";
+        } else {
+            $wp_error_message = '';
+            $error_message = " (" . $status_message . ")";
+        }
+        if (!$wp_error && $status_code == 200) {
+            $results[] = array(
+                'valid_disclosure' => true,
+                'disclosure' => $disclosure
+            );
+        } else {
+            $results[] = array(
+                'valid_disclosure' => false,
+                'disclosure' => $disclosure,
+                'is_wp_error' => $wp_error,
+                'wp_error_message' => $wp_error_message,
+                'status_code' => $status_code,
+                'status_message' => $status_message,
+                'message' => $error_message
+            );
+        }
+    }
+    return $results;
+}
+// Helper function to validate datatrainingallowed entries
+function validate_datatrainingallowed($datatrainingalloweds) {
+    $results = [];
+    $value = '';
+    // For each datatrainingallowed entry
+    foreach ($datatrainingalloweds as $datatrainingallowed) {
+        if ($datatrainingallowed == 'yes' || $datatrainingallowed == 'no') {
+            if ($value == '') {
+                $value = $datatrainingallowed;
+                $results[] = array(
+                    'valid_datatrainingallowed' => true,
+                    'datatrainingallowed' => $datatrainingallowed,
+                    'message' => 'Valid datatrainingallowed entry'
+                );
+            } elseif ($value != $datatrainingallowed) {
+                $value = $datatrainingallowed;
+                $results[] = array(
+                    'valid_datatrainingallowed' => false,
+                    'datatrainingallowed' => $datatrainingallowed,
+                    'message' => 'Conflicting datatrainingallowed entries'
+                );
+            } else {
+                $results[] = array(
+                    'valid_datatrainingallowed' => false,
+                    'datatrainingallowed' => $datatrainingallowed,
+                    'message' => 'Invalid datatrainingallowed entry'
+                );
+            }
         }
     }
     return $results;
