@@ -595,6 +595,7 @@ function validate_disclosures($disclosures) {
 function validate_datatrainingallowed($datatrainingalloweds) {
     $results = [];
     $value = '';
+    $count = 0;
     // For each datatrainingallowed entry
     foreach ($datatrainingalloweds as $datatrainingallowed) {
         if ($datatrainingallowed == 'yes' || $datatrainingallowed == 'no') {
@@ -603,6 +604,7 @@ function validate_datatrainingallowed($datatrainingalloweds) {
                 $results[] = array(
                     'valid_datatrainingallowed' => true,
                     'datatrainingallowed' => $datatrainingallowed,
+                    'count' => $count,
                     'message' => 'Valid datatrainingallowed entry'
                 );
             } elseif ($value != $datatrainingallowed) {
@@ -610,16 +612,19 @@ function validate_datatrainingallowed($datatrainingalloweds) {
                 $results[] = array(
                     'valid_datatrainingallowed' => false,
                     'datatrainingallowed' => $datatrainingallowed,
+                    'count' => $count,
                     'message' => 'Conflicting datatrainingallowed entries'
                 );
-            } else {
-                $results[] = array(
-                    'valid_datatrainingallowed' => false,
-                    'datatrainingallowed' => $datatrainingallowed,
-                    'message' => 'Invalid datatrainingallowed entry'
-                );
-            }
+            } 
+        } else {
+            $results[] = array(
+                'valid_datatrainingallowed' => false,
+                'datatrainingallowed' => $datatrainingallowed,
+                'count' => $count,
+                'message' => 'Invalid datatrainingallowed entry'
+            );
         }
+        $count = $count + 1;
     }
     return $results;
 }
