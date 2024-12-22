@@ -1,8 +1,21 @@
 <?php
 /*
-Plugin Name: Trust.txt REST API Validator with Social Verification
-Description: A REST API endpoint to validate trust.txt and verify social entries contain a Trust URI in the format trust://<domain>!
-Version: 1.4
+Plugin Name: Validator for trust.txt file referenced by Trust URI
+Description: A REST API endpoint to validate trust.txt and verify belongto=, control=, controlledby=, and vendor= entries in the trust.txt file
+    for the specified domain by fetching referenced trust.txt files and parsing for matching member=, controlledby=, control=, and vendor= entries.
+Input "url": "https://<domain>" [, "full": "true"]
+Returns: array of {"domain", "status": "found" | "not found" | "error", "message" : string}
+    linenum - line number of entry [if "full" is "true"]
+    attribute - attribute of entry [if "full" is "true"]
+    domain - domain of trust.txt file evaluated
+    status - "found" = a matching entry (e.g., "member=" for "belongto=" entry) was found for the original input domain, 
+            "not found" = a matching entry was not found for the original input domain,
+            "error" = a trust.txt file was not found or not accessible for this domain,
+            "unknown" = a login is required to access a social media account page,
+            "warning" = a warning error is found (e.g., multiple controlledby= entries)
+    "message" - a text message describing the result
+
+Version: 1.0
 
 MIT License
 
@@ -29,16 +42,44 @@ SOFTWARE.
 Author: Ralph W. Brown with assist from ChatGPT
 */
 
+// Allow CORS for REST API
+add_action('rest_api_init', function () {
+    // Log API call
+    // error_log('REST API request received: ' . json_encode($_SERVER));
+    
+    // Set the Access-Control-Allow-Origin header for all REST API responses
+    header("Access-Control-Allow-Origin: *");
+    header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+    header("Access-Control-Allow-Headers: Content-Type, Authorization");
+
+    // Respond to preflight requests
+    if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+        status_header(200);
+        exit();
+    }
+    // Make sure site allows REST API access
+    add_filter('rest_authentication_errors', function ($access) {
+        return is_wp_error($access) ? $access : true;
+    });    
+});
+
 // Register REST API route
 add_action('rest_api_init', function () {
     register_rest_route('trust-txt/v1', '/validate', array(
-        'methods' => 'POST',
+        'methods' => array('GET', 'POST', 'OPTIONS'),
         'callback' => 'validate_trust_txt',
         'args' => array(
             'url' => array(
                 'required' => true,
                 'validate_callback' => function($param, $request, $key) {
                     return filter_var($param, FILTER_VALIDATE_URL);
+                }
+            ),
+            'full' => array(
+                'required' => false, // This parameter is optional
+                'default' => 'false', // Default is not to do a full check of trust.txt file
+                'validate_callback' => function($param, $request, $key) {
+                    return in_array($param, array('true', 'false'), true); // Only allow 'true' or 'false'
                 }
             )
         ),
@@ -47,15 +88,25 @@ add_action('rest_api_init', function () {
 
 // Callback function to validate trust.txt file and referenced entries
 function validate_trust_txt($data) {
-    
+    $attributes = array(
+        'belongto=',
+        'control=',
+        'controlledby=',
+        'vendor=',
+        'customer=',
+        'member=',
+        'social=',
+        'contact=',
+        'disclosure=',
+        'datatrainingallowed='
+    );
     // Make sure to use HTTPS and extract the domain from the URL
     $url = str_ireplace('http:', 'https:', sanitize_text_field($data['url']));
     $domain = str_ireplace('www.', '', parse_url($url, PHP_URL_HOST));
+    $full = $data->get_param('full') ?: 'false'; // Optional parameter with default value
 
     // Fetch trust.txt file for the specified domain
     $response = fetch_trust_txt_url($domain);
-    $status_code = wp_remote_retrieve_response_code($response);
-    $status_message = wp_remote_retrieve_response_message($response);
     $wp_error = is_wp_error($response);
     $status_code = wp_remote_retrieve_response_code($response);
     $status_message = wp_remote_retrieve_response_message($response);
@@ -64,318 +115,266 @@ function validate_trust_txt($data) {
         $error_message = " (" . $status_message . ", " . $wp_error_message . ")";
     } else {
         $wp_error_message = '';
-        $error_message = " (" . $status_message . ")";
+        $error_message = " (" . $status_code . ": " . $status_message . ")";
     }
     if ($wp_error || $status_code != 200) {
-        return new WP_REST_Response(array(
-            'is_wp_error' => $wp_error,
-            'wp_error_message' => $wp_error_message,
-            'status_code' => $status_code,
-            'status_message' => $status_message,
-            'flag' => 'invalid',
-            'url' => $url,
+        return new WP_REST_Response(array([
+            'status' => 'error',
             'domain' => $domain,
-            'message' => 'A trust.txt file was not found at ' . $domain
+            'message' => 'A trust.txt file was not found at ' . $url . $error_message
+        ]
         ), $status_code);
     } else {
         // Retrieve trust.txt content
         $trust_txt_content = wp_remote_retrieve_body($response);
         $lines = explode("\n", $trust_txt_content);
 
-        // Initialize validation variables
-        $belongto = [];
-        $control = [];
-        $controlledby = [];
-        $customer = [];
-        $member = [];
-        $vendor = [];
-        $social = [];
-        $contact = [];
-        $disclosure = [];
-        $datatrainingallowed = [];
-        $self_reference = [];
-
-        // Loop through each line and check for the keywords
+        // Parse the trust.xt file
+        $linenums = [];
+        $attrs = [];
+        $values = [];
+        $linenum = 0;
+        $num_entries = 0;
         foreach ($lines as $line) {
-            $message = '';
-            if (strpos($line, 'belongto=') === 0) {
-                $belongto_ref = trim(str_replace('belongto=', '', $line));
-                if ($domain == str_ireplace('www.', '', parse_url($belongto_ref, PHP_URL_HOST))) {
-                    $self_reference[] = $belongto_ref;
+            $linenum = $linenum + 1;
+            // Loop through each attribute type
+            foreach ($attributes as $attribute) {
+                if (strpos($line, $attribute) === 0) {
+                    $linenums[] = $linenum;
+                    $attrs[] = $attribute;
+                    $values[] = trim(str_replace($attribute, '', $line));
+                    $num_entries += 1;
                 }
-                $belongto[] = $belongto_ref;
-            }
-            if (strpos($line, 'control=') === 0) {
-                $control_ref = trim(str_replace('control=', '', $line));
-                if ($domain == str_ireplace('www.', '', parse_url($control_ref, PHP_URL_HOST))) {
-                    $self_reference[] = $control_ref;
-                }
-                $control[] = $control_ref;
-            }
-            if (strpos($line, 'controlledby=') === 0) {
-                $controlledby_ref = trim(str_replace('controlledby=', '', $line));
-                if ($domain == str_ireplace('www.', '', parse_url($controlledby_ref, PHP_URL_HOST))) {
-                    $self_reference[] = $controlledby_ref;
-                }
-                $controlledby[] = $controlledby_ref;
-            }
-            if (strpos($line, 'customer=') === 0) {
-                $customer_ref = trim(str_replace('customer=', '', $line));
-                if ($domain == str_ireplace('www.', '', parse_url($customer_ref, PHP_URL_HOST))) {
-                    $self_reference[] = $customer_ref;
-                }
-                $customer[] = $customer_ref;
-            }
-            if (strpos($line, 'member=') === 0) {
-                $member_ref = trim(str_replace('member=', '', $line));
-                if ($domain == str_ireplace('www.', '', parse_url($member_ref, PHP_URL_HOST))) {
-                    $self_reference[] = $member_ref;
-                }
-                $member[] = $member_ref;
-            }
-            if (strpos($line, 'vendor=') === 0) {
-                $vendor_ref = trim(str_replace('vendor=', '', $line));
-                if ($domain == str_ireplace('www.', '', parse_url($vendor_ref, PHP_URL_HOST))) {
-                    $self_reference[] = $vendor_ref;
-                }
-                $vendor[] = $vendor_ref;
-            }
-            if (strpos($line, 'social=') === 0) {
-                $social[] = trim(str_replace('social=', '', $line));
-            }
-            if (strpos($line, 'contact=') === 0) {
-                $contact[] = trim(str_replace('contact=', '', $line));
-            }
-            if (strpos($line, 'disclosure=') === 0) {
-                $disclosure[] = trim(str_replace('disclosure=', '', $line));
-            }
-            if (strpos($line, 'datatrainingallowed=') === 0) {
-                $datatrainingallowed[] = trim(str_replace('datatrainingallowed=', '', $line));
             }
         }
-
-        // Validate referenced trust.txt files
-        $referenced_validations = validate_referenced_trust_txts($belongto, $controlledby, $vendor, $member, $control, $customer, $domain);
-
-        // Validate social entries for the Trust URI
-        $social_validations = validate_social_trust_uri($social, $domain);
-
-        // Validate contact entries
-        $contact_validations = validate_contacts($contact);
-
-        // Validate disclosure entries
-        $disclosure_validations = validate_disclosures($disclosure);
-
-        // Validate datatrainingallowed entries
-        $datatrainingallowed_validations = validate_datatrainingallowed($datatrainingallowed);
+        //* Validate references
+        $referenced_validations = validate_referenced_trust_txts($num_entries, $linenums, $attrs, $values, $domain, $full);
 
         // Check for self referential entries
-        if (count($self_reference) == 0) {
-            $flag = 'checkmark';
-            $message = 'A trust.txt file was found at ' . $domain;
-        } else {
-            $flag = 'warning';
-            $message = 'Self referential entries found in trust.txt file at ' . $domain;
-        }
-
-        // Check for multiple controlledby entries
-        if (count($controlledby) > 1) {
-            $flag = 'invalid';
-            if ($message != '') {
-                $message = 'Multiple "controlledby=" entries found in trust.txt file at ' . $domain;
-            } else {
-                $message = $message . '\nMultiple "controlledby=" entries found in trust.txt file at ' . $domain;
+        $self_reference = [];
+        for ($i = 0; $i < $num_entries; $i++) {
+            $linenum = $linenums[$i];
+            $attribute = $attrs[$i];
+            $reference_url = str_ireplace('http:', 'https:', sanitize_text_field($values[$i]));
+            $reference_domain = str_ireplace('www.', '', parse_url($reference_url, PHP_URL_HOST));
+            if ($attribute !== 'social=' && $attribute !== 'contact=' && $attribute !== 'disclosure=' && $attribute !== 'datatrainingallowed='  && $reference_url === $url) {
+                if ($full === 'false') {
+                    $self_reference[] = array(
+                        'status' => 'warning',
+                        'domain' => $reference_domain,
+                        'message' => 'Self referential entry found in trust.txt file at ' . $reference_url
+                    );
+                } else {
+                    $self_reference[] = array(
+                        'linenum' => $linenum,
+                        'attribute' => $attribute,
+                        'status' => 'warning',
+                        'domain' => $reference_domain,
+                        'message' => 'Self referential entry found in trust.txt file at ' . $reference_url
+                    );
+                }
             }
         }
+        // Check for multiple controlledby= entries
+        $control_err = [];
+        $control_cnt = 0;
+        for ($i = 0; $i < $num_entries; $i++) {
+            $linenum = $linenums[$i];
+            $attribute = $attrs[$i];
+            $reference_url = str_ireplace('http:', 'https:', sanitize_text_field($values[$i]));
+            $reference_domain = str_ireplace('www.', '', parse_url($reference_url, PHP_URL_HOST));
+            if ($attribute === 'controlledby=') {
+                $control_cnt += 1;
+                if ($control_cnt > 1) {
+                    if ($full === 'false') {
+                        $control_err[] = array(
+                            'status' => 'error',
+                            'domain' => $reference_domain,
+                            'message' => 'Multiple controlledby= entry found in trust.txt file at ' . $url
+                        );
+                    } else {
+                        $control_err[] = array(
+                            'linenum' => $linenum,
+                            'attribute' => 'controlledby=',
+                            'status' => 'error',
+                            'domain' => $reference_domain,
+                            'message' => 'Multiple controlledby= found in trust.txt file at ' . $url
+                        );
+                    }
+                }
+            }
+        }
+        // If we are only validating a Trust URI reference just return the belongto=, control=, controlledby=, and vendor= references
+        if ($full === 'false') {
+            $result = array_merge($referenced_validations, $self_reference, $control_err);
+            return new WP_REST_Response($result, 200);
+        } else {
+            // Otherwise, validate social=, contact=, and disclosure= references
 
-        // Prepare the result array
-        $result = array(
-            'is_wp_error' => $wp_error,
-            'wp_error_message' => $wp_error_message,
-            'status_code' => $status_code,
-            'status_message' => $status_message,
-            'error_message' => $error_message,
-            'flag' => $flag,
-            'url' => $url,
-            'domain' => $domain,
-            'message' => $message,
-            'belongto' => $belongto,
-            'control' => $control,
-            'controlledby' => $controlledby,
-            'customer' => $customer,
-            'member' => $member,
-            'vendor' => $vendor,
-            'social' => $social,
-            'contact' => $contact,
-            'disclosure' => $disclosure,
-            'datatrainingallowed' => $datatrainingallowed,
-            'self_reference' => $self_reference,
-            'referenced_validations' => $referenced_validations,
-            'social_validations' => $social_validations,
-            'contact_validations' => $contact_validations,
-            'disclosure_validations' => $disclosure_validations,
-            'datatrainingallowed_validations' => $datatrainingallowed_validations
-        );
-        // Remove empty entries
-        if (count($belongto) == 0) {
-            unset($result["belongto"]);
+            // Validate social entries
+            $social_validations = validate_social_trust_uri($num_entries, $linenums, $attrs, $values, $domain);
+
+            // Validate contact entries
+            $contact_validations = validate_contacts($num_entries, $linenums, $attrs, $values);
+
+            // Validate disclosure entries
+            $disclosure_validations = validate_disclosures($num_entries, $linenums, $attrs, $values);
+
+            // Validate datatrainingallowed entries
+            $datatrainingallowed_validations = validate_datatrainingallowed($num_entries, $linenums, $attrs, $values, $domain);
+            /*
+            for ($i = 0; $i < $num_entries; $i++) {
+                $result[] = array(
+                    'linenum' => $linenums[$i],
+                    'attribute' => $attrs[$i],
+                    'value' => $values[$i]
+                );
+            }
+            */
+            // Prepare the result array
+            
+            $result = array_merge($referenced_validations, $social_validations, $contact_validations, $disclosure_validations, 
+                $self_reference, $control_err, $datatrainingallowed_validations);
+            
+            return new WP_REST_Response($result, 200);
         }
-        if (count($control) == 0) {
-            unset($result["control"]);
-        }
-        if (count($controlledby) == 0) {
-            unset($result["controlledby"]);
-        }
-        if (count($customer) == 0) {
-            unset($result["customer"]);
-        }
-        if (count($member) == 0) {
-            unset($result["member"]);
-        }
-        if (count($vendor) == 0) {
-            unset($result["vendor"]);
-        }
-        if (count($contact) == 0) {
-            unset($result["contact"]);
-            unset($result["contact_validations"]);
-        }
-        if (count($disclosure) == 0) {
-            unset($result["disclosure"]);
-            unset($result["disclosure_validations"]);
-        }
-        if (count($datatrainingallowed) == 0) {
-            unset($result["datatrainingallowed"]);
-            unset($result["datatrainingallowed_validations"]);
-        }
-        if (count($self_reference) == 0) {
-            unset($result["self_reference"]);
-        }
-        return new WP_REST_Response($result, 200);
     }
 }
 // Helper function to fetch the trust.txt file from .well-known or root directory
 function fetch_trust_txt_url($domain) {
     // Try fetching the trust.txt file from the root "/" directory first
     $trust_txt_url = 'https://www.' . rtrim($domain, '/') . '/trust.txt';
-    $response = wp_remote_get($trust_txt_url);
+    $response_root = wp_remote_get($trust_txt_url);
 
-    // If trust.txt is not found at root "/" directory, fallback to .well-known/trust.txt
-    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) != 200) {
+    // If trust.txt is not found at root "/" directory, fallback to /.well-known/trust.txt
+    if (is_wp_error($response_root) || wp_remote_retrieve_response_code($response_root) != 200) {
         $trust_txt_url = 'https://www.' . rtrim($domain, '/') . '/.well-known/trust.txt';
         $response = wp_remote_get($trust_txt_url);
+        // Return the most informative response (the one with a wp_error if there was one)
+        if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) == 200) {
+            return $response;
+        }
     }
-    // Return response
-    return $response;
+    return $response_root;
 }
 // Helper function to validate referenced trust.txt files
-function validate_referenced_trust_txts($belongto, $controlledby, $vendor, $member, $control, $customer, $original_domain) {
-    $all_references = array_merge($belongto, $controlledby, $vendor, $member, $control, $customer);
+function validate_referenced_trust_txts($num_entries, $linenums, $attrs, $values, $domain, $full) {
+    // Map forward attributes to reverse attributes, 'social=', 'contact=', 'disclosure=', and 'datatrainingallowed=' do not have reverse attributes
+    $fwd2rev = array(
+        'belongto=' => 'member=',
+        'member=' => 'belongto=',
+        'control=' => 'controlledby=',
+        'controlledby=' => 'control=',
+        'vendor=' => 'customer=',
+        'customer=' => 'vendor=',
+        'social=' => '',
+        'contact=' => '',
+        'disclosure=' => '',
+        'datatrainingallowed=' => ''
+    );
     $results = [];
-    $count = 0;
+    
+    // Loop through each trust.txt file entry
+    for ($i = 0; $i < $num_entries; $i++) {
+        $linenum = $linenums[$i];
+        $attribute = $attrs[$i];
+        $value = $values[$i];
 
-    // For each forward reference (belongto <=> member, or control <=> controlledby, or vendor <=> customer) check to see if a reverse reference exists
-    foreach ($all_references as $reference_url) {
-        // Determine forward and reverse attributes for this reference
-        $fwd_attr = "undefined";
-        $rev_attr = "undefined";
+        // If we are only validating a Trust URI reference just return the belongto=, control=, controlledby=, and vendor= references, and
+        // skip the member= and customer= references
+        if ($full === 'false' && ($attribute === 'member=' || $attribute === 'customer=')) {
+            continue;
+        }
+        // Get the reverse attribute for this reference
+        $rev_attr = $fwd2rev[$attribute];
         $rev_attr_found = false;
-        if (array_search($reference_url,$belongto,true) !== false) {
-            $fwd_attr = "belongto";
-            $rev_attr = "member";
-        }
-        if (array_search($reference_url,$controlledby,true) !== false) {
-            $fwd_attr = "controlledby";
-            $rev_attr = "control";
-        }
-        if (array_search($reference_url,$vendor,true) !== false) {
-            $fwd_attr = "vendor";
-            $rev_attr = "customer";
-        }
-        if (array_search($reference_url,$member,true) !== false) {
-            $fwd_attr = "member";
-            $rev_attr = "belongto";
-        }
-        if (array_search($reference_url,$control,true) !== false) {
-            $fwd_attr = "control";
-            $rev_attr = "controlledby";
-        }
-        if (array_search($reference_url,$customer,true) !== false) {
-            $fwd_attr = "customer";
-            $rev_attr = "vendor";
-        }
-        // Make sure to use HTTPS and extract the domain from the URL
-        $url = str_ireplace('http:', 'https:', sanitize_text_field($reference_url));
-        $reference_domain = str_ireplace('www.', '', parse_url($url, PHP_URL_HOST));
-        // Fetch referenced trust.txt file
-        $response = fetch_trust_txt_url($reference_domain);
-        $wp_error = is_wp_error($response);
-        $status_code = wp_remote_retrieve_response_code($response);
-        $status_message = wp_remote_retrieve_response_message($response);
-        if ($wp_error == true) {
-            $wp_error_message = $response->get_error_message();
-            $error_message = " (" . $status_message . ", " . $wp_error_message . ")";
-        } else {
-            $wp_error_message = '';
-            $error_message = " (" . $status_message . ")";
-        }
-        // If fetch successful check the referenced trust.txt file for a reverse reference with the appropriate reverse attribute
-        if (!$wp_error && $status_code == 200) {
-            $trust_txt_content = wp_remote_retrieve_body($response);
-            $lines = explode("\n", $trust_txt_content);
-            // Check each line for a reverse attribute match containing the original domain of the referencing site
-            foreach ($lines as $line) {
-                if (strpos($line, $rev_attr . '=') === 0 && strpos($line, $original_domain) !== false) {
-                    $rev_attr_found = true;
+
+        // If the reverse attribute is not null then check for a corresponding reverse attribute in the referenced trust.txt file
+        if ($rev_attr != '') {
+            // Make sure to use HTTPS and extract the domain from the URL
+            $reference_url = str_ireplace('http:', 'https:', sanitize_text_field($value));
+            $reference_domain = str_ireplace('www.', '', parse_url($reference_url, PHP_URL_HOST));
+            // Fetch referenced trust.txt file
+            $response = fetch_trust_txt_url($reference_domain);
+            $wp_error = is_wp_error($response);
+            $status_code = wp_remote_retrieve_response_code($response);
+            $status_message = wp_remote_retrieve_response_message($response);
+            if ($wp_error == true) {
+                $wp_error_message = $response->get_error_message();
+                $error_message = " (" . $status_message . ", " . $wp_error_message . ")";
+            } else {
+                $wp_error_message = '';
+                $error_message = " (" . $status_code . ": " . $status_message . ")";
+            }
+            // If fetch successful check the referenced trust.txt file for a reverse reference with the appropriate reverse attribute
+            if (!$wp_error && $status_code == 200) {
+                $trust_txt_content = wp_remote_retrieve_body($response);
+                $lines = explode("\n", $trust_txt_content);
+                // Check each line for a reverse attribute match containing the original domain of the referencing site
+                foreach ($lines as $line) {
+                    if (strpos($line, $rev_attr) === 0 && strpos($line, $domain) !== false) {
+                        $rev_attr_found = true;
+                    }
+                }
+                if ($rev_attr_found) {
+                    $message = 'Corresponding "' . $rev_attr . 'https://www.' . $domain . '/" found at ' . $reference_url;
+                    $status = 'found';
+                } else {
+                    $message = 'Corresponding "' . $rev_attr . 'https://www.' . $domain . '/" not found at ' . $reference_url;
+                    $status = 'not found';
+                }
+                // Add the results for this referenced trust.txt to the restults array
+                if ($full === 'false') {
+                    $results[] = array(
+                        'status' => $status,
+                        'domain' => str_ireplace('www.', '', parse_url($reference_url, PHP_URL_HOST)),
+                        'message' => $message
+                    );
+                } else {
+                    $results[] = array(
+                        'linenum' => $linenum,
+                        'attribute' => $attribute,
+                        'status' => $status,
+                        'domain' => str_ireplace('www.', '', parse_url($reference_url, PHP_URL_HOST)),
+                        'message' => $message
+                    );
+                }
+            } else {
+                // If the referenced trust.txt file is not found or cannot be retrieved
+                if ($full === 'false') {
+                    $results[] = array(
+                        'status' => 'error',
+                        'domain' => str_ireplace('www.', '', parse_url($reference_url, PHP_URL_HOST)),
+                        'message' => 'A trust.txt file was not found at ' . $reference_url . $error_message
+                    );
+                } else {
+                    $results[] = array(
+                        'linenum' => $linenum,
+                        'attribute' => $attribute,
+                        'status' => 'error',
+                        'domain' => str_ireplace('www.', '', parse_url($reference_url, PHP_URL_HOST)),
+                        'message' => 'A trust.txt file was not found at ' . $reference_url . $error_message
+                    );
                 }
             }
-            if ($rev_attr_found) {
-                $message = 'Corresponding "' . $rev_attr . '=https://www.' . $original_domain . '/" found at ' . $reference_url;
-                $flag = 'checkmark';
-            } else {
-                $message = 'Corresponding "' . $rev_attr . '=https://www.' . $original_domain . '/" not found at ' . $reference_url;
-                $flag = 'invalid';
-            }
-            // Add the results for this referenced trust.txt to the restults array
-            $results[] = array(
-                'is_wp_error' => $wp_error,
-                'wp_error_message' => $wp_error_message,
-                'status_code' => $status_code,
-                'status_message' => $status_message,
-                'error_message' => $error_message,
-                'flag' => $flag,
-                'reference_url' => $url,
-                'reference_domain' => $reference_domain,
-                'fwd_attr' => $fwd_attr,
-                'rev_attr' => $rev_attr,
-                'rev_attr_found' => $rev_attr_found,
-                'message' => $message
-            );
-        } else {
-            // If the referenced trust.txt file is not found or cannot be retrieved
-            $results[] = array(
-                'is_wp_error' => $wp_error,
-                'wp_error_message' => $wp_error_message,
-                'status_code' => $status_code,
-                'status_message' => $status_message,
-                'error_message' => $error_message,
-                'flag' => 'unknown',
-                'reference_url' => $url,
-                'fwd_attr' => $fwd_attr,
-                'rev_attr' => $rev_attr,
-                'rev_attr_found' => $rev_attr_found,
-                'message' => 'A trust.txt file was not found at ' . $url
-            );
         }
-        $count = $count +1;
     }
     return $results;
 }
 // Helper function to validate social entries for the Trust URI
-function validate_social_trust_uri($social_urls, $original_domain) {
+function validate_social_trust_uri($num_entries, $linenums, $attrs, $values, $original_domain) {
     $results = [];
     $trust_uri = "trust://$original_domain!";
-
-    foreach ($social_urls as $social_url) {
+    // Loop through each trust.txt file entry
+    for ($i = 0; $i < $num_entries; $i++) {
+        // Skip entry if not a social= entry
+        if ($attribute !== 'social=') {
+            continue;
+        }
+        $linenum = $linenums[$i];
+        $attribute = $attrs[$i];
+        $social_url = $values[$i];
+        // Get social URL
         $response = wp_remote_get($social_url);
         $wp_error = is_wp_error($response);
         $status_code = wp_remote_retrieve_response_code($response);
@@ -392,15 +391,10 @@ function validate_social_trust_uri($social_urls, $original_domain) {
             // Check if the Trust URI is present in the page content
             if (strpos($page_content, $trust_uri) !== false) {
                 $results[] = array(
-                    'is_wp_error' => $wp_error,
-                    'wp_error_message' => $wp_error_message,
-                    'status_code' => $status_code,
-                    'status_message' => $status_message,
-                    'error_message' => $error_message,
-                    'flag' => 'checkmark',
-                    'trust_uri_found' => true,
-                    'trust_uri' => $trust_uri,
-                    'social_url' => $social_url,
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'found',
+                    'domain' => str_ireplace('www.', '', parse_url($social_url, PHP_URL_HOST)),
                     'message' => 'Trust URI ' . $trust_uri . ' found on social network account page ' . $social_url
                 );
             // Check if login is required
@@ -414,31 +408,18 @@ function validate_social_trust_uri($social_urls, $original_domain) {
                 if ((preg_match($pattern[0],$page_content) == 1) || (preg_match($pattern[1],$page_content) == 1) || 
                     (preg_match($pattern[2],$page_content) == 1) || (preg_match($pattern[3],$page_content) == 1)) {
                     $results[] = array(
-                        'status' => 'not found',
-                        'is_wp_error' => $wp_error,
-                        'wp_error_message' => $wp_error_message,
-                        'status_code' => $status_code,
-                        'status_message' => $status_message,
-                        'error_message' => $error_message,
-                        'flag' => 'unknown',
-                        'trust_uri_found' => false,
-                        'trust_uri' => $trust_uri,
-                        'social_url' => $social_url,
+                        'linenum' => $linenum,
+                        'attribute' => $attribute,
+                        'status' => 'unknown',
+                        'domain' => str_ireplace('www.', '', parse_url($social_url, PHP_URL_HOST)),
                         'message' => 'Login required for social network account page ' . $social_url
                     );
                 } else {
                     $results[] = array(
+                        'linenum' => $linenum,
+                        'attribute' => $attribute,
                         'status' => 'not found',
-                        'is_wp_error' => $wp_error,
-                        'wp_error_message' => $wp_error_message,
-                        'status_code' => $status_code,
-                        'status_message' => $status_message,
-                        'error_message' => $error_message,
-                        'flag' => 'invalid',
-                        'trust_uri_found' => false,
-                        'trust_uri' => $trust_uri,
-                        'social_url' => $social_url,
-                        'page_content' => $page_content,
+                        'domain' => str_ireplace('www.', '', parse_url($social_url, PHP_URL_HOST)),
                         'message' => 'Trust URI ' . $trust_uri . ' not found on social network account page ' . $social_url
                     );
                 }
@@ -446,26 +427,29 @@ function validate_social_trust_uri($social_urls, $original_domain) {
         } else {
             // If the social page cannot be retrieved
             $results[] = array(
-                'status' => 'not found',
-                'is_wp_error' => $wp_error,
-                'wp_error_message' => $wp_error_message,
-                'trust_uri_found' => false,
-                'status_code' => $status_code,
-                'status_message' => $status_message,
-                'error_message' => $error_message,
-                'flag' => 'unknown',
-                'social_url' => $social_url,
+                'linenum' => $linenum,
+                'attribute' => $attribute,
+                'status' => 'error',
+                'domain' => str_ireplace('www.', '', parse_url($social_url, PHP_URL_HOST)),
                 'message' => 'Could not retrieve the social network account page ' . $social_url
             );
         }
     }
     return $results;
 }
+
 // Helper function to validate contact entries
-function validate_contacts($contacts) {
+function validate_contacts($num_entries, $linenums, $attrs, $values) {
     $results = [];
-    // For each contact entry
-    foreach ($contacts as $contact) {
+    // Loop through each trust.txt file entry
+    for ($i = 0; $i < $num_entries; $i++) {
+        $linenum = $linenums[$i];
+        $attribute = $attrs[$i];
+        $contact = $values[$i];
+        // Skip if entry not a contact= entry
+        if ($attribute !== 'contact=') {
+            continue;
+        }
         // Verify contact scheme is valid
         $scheme = parse_url($contact, PHP_URL_SCHEME);
         if ($scheme == 'mailto')
@@ -473,30 +457,38 @@ function validate_contacts($contacts) {
             $email = str_ireplace('mailto:','',$contact);
             if (is_email($email)) {
                 $results[] = array(
-                    'valid_contact' => true,
-                    'scheme' => $scheme,
-                    'contact' => $contact
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'found',
+                    'domain' => $scheme,
+                    'message' => 'Email contact found ' . $contact
                 );
             } else {
                 $results[] = array(
-                    'valid_contact' => false,
-                    'scheme' => $scheme,
-                    'contact' => $contact
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'error',
+                    'domain' => $scheme,
+                    'message' => 'Email contact not valid ' . $contact
                 );
             }
         } elseif ($scheme == 'tel') {
             $phone = str_ireplace('tel:','',$contact);
             if (strlen(filter_var($contact, FILTER_SANITIZE_NUMBER_INT)) >= 10) {
                 $results[] = array(
-                    'valid_contact' => true,
-                    'scheme' => $scheme,
-                    'contact' => $contact
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'found',
+                    'domain' => $scheme,
+                    'message' => 'Phone contact found ' . $contact
                 );
             } else {
                 $results[] = array(
-                    'valid_contact' => false,
-                    'scheme' => $scheme,
-                    'contact' => $contact
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'found',
+                    'domain' => $scheme,
+                    'message' => 'Phone contact not valid ' . $contact
                 );
             }
         } elseif ($scheme == 'http' || $scheme == 'https') {
@@ -514,41 +506,46 @@ function validate_contacts($contacts) {
             }
             if (!$wp_error && $status_code == 200) {
                 $results[] = array(
-                    'valid_contact' => true,
-                    'scheme' => $scheme,
-                    'contact' => $contact
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'found',
+                    'domain' => str_ireplace('www.', '', parse_url($contact, PHP_URL_HOST)),
+                    'message' => 'Contact page found at ' . $contact
                 );
             } else {
                 $results[] = array(
-                    'valid_contact' => false,
-                    'scheme' => $scheme,
-                    'contact' => $contact,
-                    'is_wp_error' => $wp_error,
-                    'wp_error_message' => $wp_error_message,
-                    'status_code' => $status_code,
-                    'status_message' => $status_message,
-                    'message' => $error_message
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'not found',
+                    'domain' => str_ireplace('www.', '', parse_url($contact, PHP_URL_HOST)),
+                    'message' => 'Contact page not found at ' . $contact . $error_message
                 );
             }
         } else {
             // Check if missing "mailto:" or "tel" in contact
             if (is_email($contact)) {
                 $results[] = array(
-                    'valid_contact' => true,
-                    'scheme' => 'mailto',
-                    'contact' => $contact
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'found',
+                    'domain' => 'mailto',
+                    'message' => 'Email contact found ' . $contact
                 );
             } elseif (strlen(filter_var($contact, FILTER_SANITIZE_NUMBER_INT)) >= 10) {
                 $results[] = array(
-                    'valid_contact' => true,
-                    'scheme' => 'tel',
-                    'contact' => $contact
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'found',
+                    'domain' => 'tel',
+                    'message' => 'Phone contact found ' . $contact
                 );
             } else {
                 $results[] = array(
-                    'valid_contact' => false,
-                    'scheme' => $scheme,
-                    'contact' => $contact
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'error',
+                    'domain' => 'unknown scheme',
+                    'contact' => 'Unknown contact ' . $contact
                 );
             }
         }
@@ -556,10 +553,17 @@ function validate_contacts($contacts) {
     return $results;
 }
 // Helper function for disclosures
-function validate_disclosures($disclosures) {
+function validate_disclosures($num_entries, $linenums, $attrs, $values) {
     $results = [];
-    // For each disclosure entry
-    foreach ($disclosures as $disclosure) {
+    // Loop through each trust.txt file entry
+    for ($i = 0; $i < $num_entries; $i++) {
+        $linenum = $linenums[$i];
+        $attribute = $attrs[$i];
+        $disclosure = $values[$i];
+        // Skip if entry not a disclosure= entry
+        if ($attribute !== 'disclosure=') {
+            continue;
+        }
         // Fetch contact URL
         $response = wp_remote_get($disclosure);
         $wp_error = is_wp_error($response);
@@ -574,54 +578,67 @@ function validate_disclosures($disclosures) {
         }
         if (!$wp_error && $status_code == 200) {
             $results[] = array(
-                'valid_disclosure' => true,
-                'disclosure' => $disclosure
+                'linenum' => $linenum,
+                'attribute' => $attribute,
+                'status' => 'found',
+                'domain' => str_ireplace('www.', '', parse_url($disclosure, PHP_URL_HOST)),
+                'message' => 'Disclosure page found at ' . $disclosure
             );
         } else {
             $results[] = array(
-                'valid_disclosure' => false,
-                'disclosure' => $disclosure,
-                'is_wp_error' => $wp_error,
-                'wp_error_message' => $wp_error_message,
-                'status_code' => $status_code,
-                'status_message' => $status_message,
-                'message' => $error_message
+                'linenum' => $linenum,
+                'attribute' => $attribute,
+                'status' => 'error',
+                'domain' => str_ireplace('www.', '', parse_url($disclosure, PHP_URL_HOST)),
+                'message' => 'Disclosure page not found at ' . $disclosure . $error_message
             );
         }
     }
     return $results;
 }
 // Helper function to validate datatrainingallowed entries
-function validate_datatrainingallowed($datatrainingalloweds) {
+function validate_datatrainingallowed($num_entries, $linenums, $attrs, $values, $domain) {
     $results = [];
     $value = '';
     $count = 0;
-    // For each datatrainingallowed entry
-    foreach ($datatrainingalloweds as $datatrainingallowed) {
+    // Loop through each trust.txt file entry
+    for ($i = 0; $i < $num_entries; $i++) {
+        $linenum = $linenums[$i];
+        $attribute = $attrs[$i];
+        $datatrainingallowed = $values[$i];
+        // Skip if entry not a datatrainingallowed= entry
+        if ($attribute !== 'datatrainingallowed=') {
+            continue;
+        }
+        // Check if datatrainingallowed is a yes or no
         if ($datatrainingallowed == 'yes' || $datatrainingallowed == 'no') {
+            // Check if datatrainingallowed has been previously set to a conflicting value
             if ($value == '') {
                 $value = $datatrainingallowed;
                 $results[] = array(
-                    'valid_datatrainingallowed' => true,
-                    'datatrainingallowed' => $datatrainingallowed,
-                    'count' => $count,
-                    'message' => 'Valid datatrainingallowed entry'
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'found',
+                    'domain' => $domain,
+                    'message' => 'Valid datatrainingallowed entry ' . $datatrainingallowed
                 );
             } elseif ($value != $datatrainingallowed) {
                 $value = $datatrainingallowed;
                 $results[] = array(
-                    'valid_datatrainingallowed' => false,
-                    'datatrainingallowed' => $datatrainingallowed,
-                    'count' => $count,
-                    'message' => 'Conflicting datatrainingallowed entries'
+                    'linenum' => $linenum,
+                    'attribute' => $attribute,
+                    'status' => 'error',
+                    'domain' => $domain,
+                    'message' => 'Conflicting datatrainingallowed entries ' . $datatrainingallowed
                 );
             } 
         } else {
             $results[] = array(
-                'valid_datatrainingallowed' => false,
-                'datatrainingallowed' => $datatrainingallowed,
-                'count' => $count,
-                'message' => 'Invalid datatrainingallowed entry'
+                'linenum' => $linenum,
+                'attribute' => $attribute,
+                'status' => 'error',
+                'domain' => $domain,
+                'message' => 'Invalid datatrainingallowed entry ' . $datatrainingallowed
             );
         }
         $count = $count + 1;
