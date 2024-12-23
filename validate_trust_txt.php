@@ -367,13 +367,13 @@ function validate_social_trust_uri($num_entries, $linenums, $attrs, $values, $or
     $trust_uri = "trust://$original_domain!";
     // Loop through each trust.txt file entry
     for ($i = 0; $i < $num_entries; $i++) {
+        $linenum = $linenums[$i];
+        $attribute = $attrs[$i];
+        $social_url = $values[$i];
         // Skip entry if not a social= entry
         if ($attribute !== 'social=') {
             continue;
         }
-        $linenum = $linenums[$i];
-        $attribute = $attrs[$i];
-        $social_url = $values[$i];
         // Get social URL
         $response = wp_remote_get($social_url);
         $wp_error = is_wp_error($response);
